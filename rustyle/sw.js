@@ -1,5 +1,5 @@
 // Service worker: офлайн-оболочка приложения. API всегда идёт в сеть.
-const V = 'rustyle-v3';
+const V = 'rustyle-v4';
 const SHELL = ['./', 'css/app.css', 'js/app.js', 'js/core.js', 'js/client.js', 'js/tryon.js', 'js/master.js', 'js/owner.js', 'js/nailart.js', 'js/localapi.js', 'icons/icon.svg', 'icons/icon-192.png', 'manifest.webmanifest'];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(V).then((c) => Promise.all(SHELL.map((u) => c.add(u).catch(() => {})))).then(() => self.skipWaiting())); });
 self.addEventListener('activate', (e) => { e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== V).map((k) => caches.delete(k)))).then(() => self.clients.claim())); });

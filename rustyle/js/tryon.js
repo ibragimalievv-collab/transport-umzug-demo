@@ -105,7 +105,7 @@ function measure(hand, hi, live) {
 // MediaPipe находит пальцы, а эта сеть (своя, обучена на открытом наборе с размеченными ногтями) находит сам ноготь
 // на вырезке вокруг кончика пальца. Она работает в фоне несколько раз в секунду; между её ответами ноготь «едет»
 // вместе с пальцем, потому что его положение хранится относительно точек пальца.
-const PS = 64, CROP = 3.6;
+const PS = 96, CROP = 5.4;
 let seg = null, segPromise = null, segBusy = false; const nailState = new Map();
 const atlas = document.createElement('canvas'); atlas.width = PS * 10; atlas.height = PS; const actx = atlas.getContext('2d', { willReadFrequently: true });
 function loadSeg() {
@@ -114,7 +114,9 @@ function loadSeg() {
     ort.env.wasm.wasmPaths = BASE + 'vendor/ort/'; ort.env.wasm.proxy = true; // считаем в отдельном потоке, чтобы картинка не подтормаживала
     ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
     const session = await ort.InferenceSession.create(BASE + 'models/nail_seg.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' });
-    seg = { ort, session };
+    // вторая сеть — для поиска ногтей по всему кадру (у неё выше полнота на мелких ногтях)
+    const full = await ort.InferenceSession.create(BASE + 'models/nail_seg_full.onnx', { executionProviders: ['wasm'], graphOptimizationLevel: 'all' }).catch(() => session);
+    seg = { ort, session, full };
   })().catch((e) => { console.warn('Сеть контура ногтя не загрузилась, работаем по замерам пальца', e); }));
 }
 // Контур ногтя: 32 луча из центра до границы маски (с интерполяцией между пикселями). Углы отсчитываются от оси ногтя.
@@ -264,7 +266,7 @@ async function fullStep(src, sw, sh) {
     fctx.drawImage(src, 0, 0, W, H);
     const px = fctx.getImageData(0, 0, W, H).data, inp = new Float32Array(3 * N);
     for (let i = 0; i < N; i++) { inp[i] = px[i * 4] / 255; inp[i + N] = px[i * 4 + 1] / 255; inp[i + 2 * N] = px[i * 4 + 2] / 255; }
-    const mask = (await seg.session.run({ x: new seg.ort.Tensor('float32', inp, [1, 3, H, W]) })).mask.data;
+    const mask = (await seg.full.run({ x: new seg.ort.Tensor('float32', inp, [1, 3, H, W]) })).mask.data;
     const comps = components(mask, W, H, 18).filter((c) => c.conf > 0.72 && c.major / c.minor < 3.2 && c.n > 0.5 * c.major * c.minor);
     // цвет точки кадра (те же веса, что и в замерах)
     const col = (x, y) => { x = Math.round(x); y = Math.round(y); if (x < 0 || y < 0 || x >= W || y >= H) return null; const i = (y * W + x) * 4, Y = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]; return [Y * 0.35, px[i + 2] - Y, px[i] - Y]; };
@@ -327,10 +329,29 @@ function drawNail(ctx, cx, cy, ang, w, bed, p, f, rad) {
   const pad = Math.ceil(wn * 0.2) + 4, cw = Math.ceil(wn + pad * 2), ch = Math.ceil(h + pad * 2), ox = cw / 2, oy = ch - pad;
   for (const c of [offA, offB]) { if (c.width < cw || c.height < ch) { c.width = Math.max(c.width, cw); c.height = Math.max(c.height, ch); } }
   octxB.setTransform(1, 0, 0, 1, 0, 0); octxB.clearRect(0, 0, cw, ch); octxB.fillStyle = '#000';
-  octxB.beginPath(); // контур: ось ногтя (x) смотрит вверх, начало координат — у кутикулы
-  for (let k = 0; k <= RAYS; k++) { const a = pts[k % RAYS], b = pts[(k + 1) % RAYS], X = (q) => ox + q[1], Y = (q) => oy - (q[0] + back), mx = (X(a) + X(b)) / 2, my = (Y(a) + Y(b)) / 2; if (k === 0) octxB.moveTo(mx, my); else octxB.quadraticCurveTo(X(a), Y(a), mx, my); }
+  // Силуэт в полярном виде (64 луча из центра ногтя): контур настоящего ногтя, а спереди — наибольшее из контура и
+  // выбранной формы свободного края. Затем сглаживаем — стык получается плавным, без «ступенек».
+  const N2 = 64, sil = new Float32Array(N2);
+  for (let k = 0; k < N2; k++) { const f0 = (k * RAYS) / N2, i0 = Math.floor(f0) % RAYS, t = f0 - Math.floor(f0); sil[k] = rad[i0] * (1 - t) + rad[(i0 + 1) % RAYS] * t; }
+  if (h > bedLen + 1) {
+    const xj = -back + bedLen * 0.6; let hw = 0;
+    for (const q of pts) if (Math.abs(q[0] - xj) < bedLen * 0.14) hw = Math.max(hw, Math.abs(q[1]));
+    octxB.save(); octxB.translate(ox, oy); nailPath(octxB, (hw || half) * 2, h, T.shape); octxB.restore();
+    for (let k = 0; k < N2; k++) {
+      const th = (k * 2 * Math.PI) / N2, c = Math.cos(th), sn = Math.sin(th); if (c < -0.15) continue; // только передняя часть
+      let lo = 0, hi = h + wn; if (!octxB.isPointInPath(ox, oy - back)) continue;
+      for (let it = 0; it < 9; it++) { const m = (lo + hi) / 2; if (octxB.isPointInPath(ox + sn * m, oy - (c * m + back))) lo = m; else hi = m; }
+      const wgt = Math.min(1, (c + 0.15) / 0.5); // плавный вход формы от боков к кончику
+      sil[k] = Math.max(sil[k], sil[k] * (1 - wgt) + lo * wgt);
+    }
+    for (let pass = 0; pass < 1; pass++) { const t = Float32Array.from(sil); for (let k = 0; k < N2; k++) sil[k] = (t[(k + N2 - 1) % N2] + 2 * t[k] + t[(k + 1) % N2]) / 4; }
+  }
+  octxB.beginPath();
+  for (let k = 0; k <= N2; k++) {
+    const P2 = (i) => { const th = ((i % N2) * 2 * Math.PI) / N2, r = sil[i % N2]; return [ox + Math.sin(th) * r, oy - (Math.cos(th) * r + back)]; };
+    const a = P2(k), b = P2(k + 1), mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2; if (k === 0) octxB.moveTo(mx, my); else octxB.quadraticCurveTo(a[0], a[1], mx, my);
+  }
   octxB.closePath(); octxB.fill();
-  if (h > bedLen + 1) { octxB.save(); octxB.translate(ox, oy); octxB.beginPath(); octxB.rect(-cw, -ch, cw * 2, ch - bedLen * 0.7); octxB.clip(); nailPath(octxB, wn, h, T.shape); octxB.fill(); octxB.restore(); }
   octxA.setTransform(1, 0, 0, 1, 0, 0); octxA.globalCompositeOperation = 'source-over'; octxA.clearRect(0, 0, cw, ch);
   octxA.save(); octxA.translate(ox, oy); octxA.fillStyle = p.base; octxA.fillRect(-cw, -ch, cw * 2, ch * 2);
   paintNail(octxA, wn, h, p, T.shape, { finger: f, img: T.tex, noClip: true }); octxA.restore();
@@ -340,7 +361,22 @@ function drawNail(ctx, cx, cy, ang, w, bed, p, f, rad) {
   ctx.shadowColor = 'rgba(30,10,15,.38)'; ctx.shadowBlur = wn * 0.07; ctx.shadowOffsetY = wn * 0.02;
   ctx.drawImage(offA, 0, 0, cw, ch, -ox, back - oy, cw, ch);
   ctx.restore();
+  // Свет настоящего ногтя поверх лака: блики и тени кадра проступают сквозь покрытие, и оно перестаёт выглядеть наклейкой.
+  if (curSrc) {
+    const R = Math.max(back, front, half) * 1.15;
+    ctx.save();
+    ctx.translate(cx, cy); ctx.rotate(ang);
+    ctx.beginPath();
+    for (let k = 0; k <= RAYS; k++) { const a = pts[k % RAYS], b = pts[(k + 1) % RAYS], mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2; if (k === 0) ctx.moveTo(mx * 0.97, my * 0.97); else ctx.quadraticCurveTo(a[0] * 0.97, a[1] * 0.97, mx * 0.97, my * 0.97); }
+    ctx.closePath(); ctx.clip();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'soft-light'; ctx.globalAlpha = p.finish === 'matte' ? 0.3 : 0.5;
+    const x0 = Math.max(0, cx - R), y0 = Math.max(0, cy - R), x1 = Math.min(ctx.canvas.width, cx + R), y1 = Math.min(ctx.canvas.height, cy + R);
+    if (x1 > x0 && y1 > y0) ctx.drawImage(curSrc, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+    ctx.restore();
+  }
 }
+let curSrc = null; // исходный кадр (видео или фото) — для света на лаке
 const offA = document.createElement('canvas'), offB = document.createElement('canvas'), octxA = offA.getContext('2d'), octxB = offB.getContext('2d');
 const sameNail = (a, list) => list.some((b) => Math.hypot(a.x - b.x, a.y - b.y) < Math.max(a.len, a.wid, b.len, b.wid) * 0.6);
 const fullActive = () => fullNails.length && (T.mode === 'photo' || performance.now() - fullAt < 1500);
@@ -356,6 +392,15 @@ function drawNails(ctx, W, H, hands) {
     hand.far = scale < Math.min(W, H) * 0.16;
     // тыльная сторона ладони? (знак векторного произведения зависит от того, левая это рука или правая)
     const hi = hands.indexOf(hand), states = FINGERS.map((_, f) => nailState.get(fkey(hand, hi, f)));
+    // Ладонь к камере? Правило по «скелету» надёжно только для раскрытой руки (хотя бы два пальца выпрямлены) —
+    // тогда ногти не рисуем, даже если сеть приняла подушечки пальцев за ногти.
+    hand.palm = false;
+    if (hand.label) {
+      const dw = (i) => Math.hypot(P[i].x - P[0].x, P[i].y - P[0].y);
+      const ext = [[6, 8], [10, 12], [14, 16], [18, 20]].filter(([pip, tip]) => dw(tip) > dw(pip) * 1.12).length;
+      const c = (P[5].x - P[0].x) * (P[17].y - P[0].y) - (P[5].y - P[0].y) * (P[17].x - P[0].x);
+      if (ext >= 2 && Math.abs(c) > scale * scale * 0.25 && !(hand.label === 'Left' ? c < 0 : c > 0)) { hand.palm = true; hand.back = false; continue; }
+    }
     const bySeg = !!seg && !!hand.label && states.some((st) => st); // сеть уже посмотрела на эту руку — рисуем только там, где она видит ноготь
     if (bySeg) hand.back = states.some((st) => st && st.p && st.miss < 3);
     else if (hand.label) {
@@ -419,14 +464,17 @@ function drawDemoHand(ctx, W, H) {
 function needFull() {
   if (!seg || T.mode === 'demo') return false;
   if (!T.hands.length) return true;
+  if (T.hands.some((h) => h.palm)) return false; // ладонь — ждём, пока руку повернут
   return T.hands.every((hand, hi) => { const st = FINGERS.map((_, f) => nailState.get(fkey(hand, hi, f))); return st.some((x) => x) && st.filter((x) => x && x.p && x.miss < 3).length < 3; });
 }
 function paint() {
   const cv = document.getElementById('ty-canvas'); if (!cv) return;
   const ctx = cv.getContext('2d'), W = cv.width, H = cv.height;
   if (T.mode === 'demo') drawDemoHand(ctx, W, H);
-  else if (T.mode === 'photo' && T.img) ctx.drawImage(T.img, 0, 0, W, H);
-  else { const v = document.getElementById('ty-video'); if (!v || v.readyState < 2) return; ctx.drawImage(v, 0, 0, W, H); }
+  else if (T.mode === 'photo' && T.img) { ctx.drawImage(T.img, 0, 0, W, H); curSrc = T.img; }
+  else { const v = document.getElementById('ty-video'); if (!v || v.readyState < 2) return; ctx.drawImage(v, 0, 0, W, H); curSrc = v; }
+  if (T.mode === 'demo') curSrc = null;
+  if (T.showOrig) { status(''); return; } // «до/после»: пока кнопка зажата, показываем руку без лака
   const useFull = needFull() && fullActive();
   if (useFull) drawFullNails(ctx, W, H); else drawNails(ctx, W, H, T.hands);
   const visible = useFull || T.hands.some((h) => h.back);
@@ -553,6 +601,9 @@ route('/tryon', async ({ query }) => {
   T.fromBook = !!query.book; T.tab = 'design'; T.debug = !!query.debug;
   onLeave(stopCamera);
   after(async () => {
+    const cmp = document.getElementById('ty-cmp'), hold = (v) => (e) => { e.preventDefault(); T.showOrig = v; cmp.classList.toggle('on', v); if (T.mode !== 'camera' || !running) paint(); };
+    cmp.addEventListener('pointerdown', hold(true)); for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) cmp.addEventListener(ev, hold(false));
+    cmp.addEventListener('contextmenu', (e) => e.preventDefault());
     status('Загружаем распознавание руки…', true);
     document.querySelector('.ty-d.on')?.scrollIntoView({ inline: 'center', block: 'nearest' });
     loadSeg();
@@ -564,6 +615,7 @@ route('/tryon', async ({ query }) => {
   return `<div class="tryon"><div class="ty-stage"><video id="ty-video" playsinline muted autoplay></video><canvas id="ty-canvas" width="720" height="960"></canvas>
       <div class="ty-top"><button class="icon-btn glass" data-act="back" aria-label="Закрыть">${ic('close')}</button><b>Примерка</b>
         <div class="row gap"><button class="icon-btn glass" data-act="tyFlip" aria-label="Сменить камеру">${ic('flip')}</button><label class="icon-btn glass" aria-label="Загрузить фото руки">${ic('image')}<input type="file" accept="image/*" hidden data-change="tyFile"></label></div></div>
+      <button class="ty-cmp" id="ty-cmp" aria-label="Сравнить: зажмите, чтобы увидеть руку без лака">До / после</button>
       <div id="ty-status" class="ty-status" hidden></div>
       <div id="ty-fallback" class="ty-fallback" hidden><div>${ic('camera')}<p></p><label class="btn">${ic('image')} Загрузить фото руки<input type="file" accept="image/*" hidden data-change="tyFile"></label>
         <button class="btn ghost" data-act="tyDemo">Примерить на демо-руке</button><button class="btn ghost" data-act="tyCam">Включить камеру</button></div></div></div>

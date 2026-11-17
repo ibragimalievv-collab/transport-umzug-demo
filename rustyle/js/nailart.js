@@ -187,7 +187,7 @@ export function paintNail(ctx, w, h, p, shape, opt = {}) {
     ctx.save(); ctx.translate(-w * 0.2, -h * 0.5); ctx.scale(1, Math.max(1, (h * 0.34) / (w * 0.09)));
     const g = ctx.createRadialGradient(0, 0, 0, 0, 0, w * 0.1); g.addColorStop(0, `rgba(255,255,255,${0.62 * light})`); g.addColorStop(1, 'rgba(255,255,255,0)');
     ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, w * 0.1, 0, 7); ctx.fill(); ctx.restore();
-    const g2 = ctx.createLinearGradient(0, 0, 0, cut * 1.5 - h * 0.1); g2.addColorStop(0, `rgba(255,255,255,${0.16 * light})`); g2.addColorStop(1, 'rgba(255,255,255,0)');
+    const g2 = ctx.createLinearGradient(0, cut, 0, -h * 0.3); g2.addColorStop(0, `rgba(255,255,255,${0.16 * light})`); g2.addColorStop(1, 'rgba(255,255,255,0)'); // мягкий отсвет у кутикулы, плавно гаснет к середине
     ctx.fillStyle = g2; ctx.fillRect(-r, -h * 0.3, w, h * 0.3 + cut);
   }
   ctx.restore();
